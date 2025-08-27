@@ -3,6 +3,7 @@ import subprocess
 import re
 import argparse
 import sys
+import os
 from typing import List, Dict, Optional, Sequence
 
 # Global safe mode setting
@@ -10,11 +11,21 @@ SAFE_MODE = True
 
 mcp = FastMCP("codex-as-mcp")
 
+# Build the path to codex.js using environment variables
+CODEX_PATH = os.path.expandvars(r"%APPDATA%\npm\node_modules\@openai\codex\bin\codex.js")
+if not os.path.exists(CODEX_PATH):
+    # Fallback to relative npm path
+    CODEX_PATH = os.path.join(os.environ.get("APPDATA", ""), "npm", "node_modules", "@openai", "codex", "bin", "codex.js")
+
+# Debug: Print the path we're using
+print(f"DEBUG: CODEX_PATH = {CODEX_PATH}")
+print(f"DEBUG: Path exists = {os.path.exists(CODEX_PATH)}")
+
 HEADER_RE = re.compile(
     r'^'
     r'\[(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})\]'   # 1: timestamp
     r'\s+'
-    r'([^\n]+)'                                    # 2: tag (整行，允许包含空格/冒号)
+    r'([^\n]+)'                                    # 2: tag (full line, allows spaces/colons)
     r'\n',
     flags=re.M
 )
@@ -34,37 +45,72 @@ def run_and_extract_codex_blocks(
     safe_mode: bool = True
 ) -> List[Dict[str, str]]:
     """
-    运行命令并抽取日志块。每个块由形如
+    Run command and extract log blocks. Each block consists of:
     [YYYY-MM-DDTHH:MM:SS] <tag>
-    <正文...直到下一个时间戳头或文件结束>
-    组成。
-
-    :param cmd: 完整命令（列表形式）
-    :param tags: 需要过滤的 tag 列表（大小写不敏感）。None 表示不过滤。
-    :param last_n: 返回最后 N 个匹配块
-    :return: [{timestamp, tag, body, raw}] 按时间顺序（旧->新）
+    <body text...until next timestamp header or end of file>
+    
+    :param cmd: Full command (as list)
+    :param tags: Tags to filter (case insensitive). None means no filtering.
+    :param last_n: Return last N matching blocks
+    :return: [{timestamp, tag, body, raw}] in time order (old->new)
     """
     # Modify command based on safe mode
     final_cmd = list(cmd)
-    if safe_mode:
-        # Replace --full-auto with read-only sandbox
+    
+    if safe_mode == True:
+        # Full safe mode: replace --full-auto with read-only sandbox
         if "--full-auto" in final_cmd:
             idx = final_cmd.index("--full-auto")
             final_cmd[idx:idx+1] = ["--sandbox", "read-only"]
+    elif safe_mode == "skip-git":
+        # Skip git mode: replace --full-auto with workspace-write sandbox
+        if "--full-auto" in final_cmd:
+            idx = final_cmd.index("--full-auto")
+            final_cmd[idx:idx+1] = ["--sandbox", "workspace-write"]
+    # If safe_mode is False (--yolo), keep --full-auto as is
     
-    proc = subprocess.run(
-        final_cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True
-    )
-    out = proc.stdout
-
+    # Debug: Print what we're trying to run
+    print(f"DEBUG: Safe mode = {safe_mode}")
+    print(f"DEBUG: Running command: {' '.join(final_cmd)}")
+    
+    try:
+        proc = subprocess.run(
+            final_cmd, 
+            stdout=subprocess.PIPE, 
+            stderr=subprocess.PIPE, 
+            text=True,
+            shell=False
+        )
+        
+        if proc.stderr:
+            print(f"DEBUG: stderr: {proc.stderr}")
+        if proc.returncode != 0:
+            print(f"DEBUG: Return code: {proc.returncode}")
+            
+        out = proc.stdout
+        print(f"DEBUG: Raw stdout (first 500 chars): {out[:500] if out else 'EMPTY'}")
+        print(f"DEBUG: Raw stdout length: {len(out) if out else 0}")
+        
+    except Exception as e:
+        print(f"DEBUG: Exception running command: {e}")
+        print(f"DEBUG: Exception type: {type(e)}")
+        raise
+    
     blocks = []
     for m in BLOCK_RE.finditer(out):
         ts, tag, body = m.group(1), m.group(2).strip(), m.group(3)
         if tags is None or tag.lower() in {t.lower() for t in tags}:
             raw = f'[{ts}] {tag}\n{body}'
             blocks.append({"timestamp": ts, "tag": tag, "body": body, "raw": raw})
-
-    # 只取最后 1 个
+    
+    print(f"DEBUG: Found {len(blocks)} blocks matching pattern")
+    
+    # If no blocks found but we have output, return the raw output
+    if not blocks and out:
+        print("DEBUG: No blocks found, returning raw output")
+        return [{"timestamp": "unknown", "tag": "codex", "body": out, "raw": out}]
+    
+    # Return only the last n blocks
     return blocks[-last_n:]
 
 
@@ -171,13 +217,62 @@ async def codex_execute(prompt: str, work_dir: str, ctx: Context) -> str:
         work_dir (str): The working directory, e.g. /Users/kevin/Projects/demo_project
         ctx (Context): MCP context for logging
     """
+    # Use --json for non-interactive output
     cmd = [
-        "codex", "exec",
-        "--full-auto", "--skip-git-repo-check",
+        "node", CODEX_PATH, "exec",
+        "--json",  # Output as JSONL for non-interactive mode
+        "--skip-git-repo-check",
         "--cd", work_dir,
-        prompt,
+        # Prompt will be passed via stdin
     ]
-    return run_and_extract_codex_blocks(cmd, safe_mode=SAFE_MODE)[-1]["raw"]
+    
+    if SAFE_MODE == True:
+        cmd.extend(["--sandbox", "read-only"])
+    elif SAFE_MODE == "skip-git":
+        cmd.extend(["--sandbox", "workspace-write"])
+    else:
+        cmd.append("--full-auto")
+    
+    print(f"DEBUG: Running: {' '.join(cmd)}")
+    print(f"DEBUG: With prompt: {prompt[:100]}...")
+    
+    try:
+        proc = subprocess.run(
+            cmd,
+            input=prompt,  # Pass prompt via stdin
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            shell=False,
+            timeout=300  # 5 minute timeout
+        )
+        
+        if proc.stdout:
+            print(f"DEBUG: Got output: {len(proc.stdout)} chars")
+            # If using --json, parse the JSONL output
+            lines = proc.stdout.strip().split('\n')
+            messages = []
+            for line in lines:
+                if line:
+                    try:
+                        import json
+                        data = json.loads(line)
+                        if 'content' in data or 'message' in data:
+                            messages.append(data.get('content', data.get('message', '')))
+                    except:
+                        messages.append(line)  # Fallback to raw line
+            
+            return '\n'.join(messages) if messages else proc.stdout
+            
+        elif proc.stderr:
+            return f"Error: {proc.stderr}"
+        else:
+            return "No output from codex"
+            
+    except subprocess.TimeoutExpired:
+        return "Error: Codex command timed out after 5 minutes"
+    except Exception as e:
+        return f"Error: {str(e)}"
 
 
 @mcp.tool()
@@ -265,7 +360,7 @@ async def codex_review(review_type: str, work_dir: str, target: str = "", prompt
     )
     
     cmd = [
-        "codex", "exec",
+        "node", CODEX_PATH, "exec",
         "--full-auto", "--skip-git-repo-check",
         "--cd", work_dir,
         final_prompt,
@@ -284,7 +379,12 @@ def main():
     parser.add_argument(
         "--yolo", 
         action="store_true",
-        help="Enable writable mode (allows file modifications, git operations, etc.)"
+        help="Enable full writable mode with --full-auto (allows file modifications, git operations, etc.)"
+    )
+    parser.add_argument(
+        "--skip-git",
+        action="store_true",
+        help="Skip git repository check but stay in workspace-write sandbox mode"
     )
     parser.add_argument(
         "--help-modes",
@@ -298,14 +398,20 @@ def main():
         print("""
 Codex-as-MCP Execution Modes:
 
-🔒 Safe Mode (default):
-  - Read-only operations only
+Safe Mode (default):
+  - Read-only operations only (--sandbox read-only)
   - No file modifications
   - No git operations  
   - Safe for exploration and analysis
   
-⚡ Writable Mode (--yolo):
-  - Full codex agent capabilities
+Skip Git Mode (--skip-git):
+  - Workspace write sandbox (--sandbox workspace-write)
+  - Can modify files in workspace
+  - Skips git repository check
+  - Safer than full auto
+  
+Writable Mode (--yolo):
+  - Full codex agent capabilities (--full-auto)
   - Can modify files, run git commands
   - Sequential execution prevents conflicts
   - Use with caution in production
@@ -317,13 +423,20 @@ and conflicting system modifications. Sequential execution is safer.
 """)
         sys.exit(0)
     
-    # Set safe mode based on --yolo flag
-    SAFE_MODE = not args.yolo
-    
-    if SAFE_MODE:
-        print("🔒 Running in SAFE mode (read-only). Use --yolo for writable mode.")
+    # Set safe mode based on flags
+    if args.yolo:
+        SAFE_MODE = False
+    elif args.skip_git:
+        SAFE_MODE = "skip-git"  # Special mode
     else:
-        print("⚡ Running in WRITABLE mode. Codex can modify files and system state.")
+        SAFE_MODE = True
+    
+    if SAFE_MODE == True:
+        print("Running in SAFE mode (read-only). Use --skip-git or --yolo for write modes.")
+    elif SAFE_MODE == "skip-git":
+        print("Running in WORKSPACE-WRITE mode (skip git check). Use --yolo for full auto.")
+    else:
+        print("Running in FULL AUTO mode. Codex can modify files and system state.")
     
     mcp.run()
 
