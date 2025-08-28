@@ -4,22 +4,54 @@ import re
 import argparse
 import sys
 import os
+from shutil import which
 from typing import List, Dict, Optional, Sequence
 
 # Global safe mode setting
 SAFE_MODE = True
 
+# Expose the server with the name expected by clients/config (e.g., "codex")
 mcp = FastMCP("codex-as-mcp")
 
-# Build the path to codex.js using environment variables
-CODEX_PATH = os.path.expandvars(r"%APPDATA%\npm\node_modules\@openai\codex\bin\codex.js")
-if not os.path.exists(CODEX_PATH):
-    # Fallback to relative npm path
-    CODEX_PATH = os.path.join(os.environ.get("APPDATA", ""), "npm", "node_modules", "@openai", "codex", "bin", "codex.js")
+# Resolve how to invoke Codex CLI in a cross-platform way
+def resolve_codex_invoker() -> List[str]:
+    # First check if codex.cmd exists on Windows (typical npm install)
+    if sys.platform == "win32":
+        # Try the .cmd wrapper first (typical npm global install)
+        codex_cmd = which("codex.cmd")
+        if codex_cmd:
+            print(f"DEBUG: Using codex.cmd at {codex_cmd}", file=sys.stderr)
+            return [codex_cmd]
+            
+        # Try codex without extension
+        codex_exe = which("codex")
+        if codex_exe:
+            print(f"DEBUG: Using codex at {codex_exe}", file=sys.stderr)
+            return [codex_exe]
+            
+        # Try the direct npm path on Windows
+        npm_path = os.path.expandvars(r"%APPDATA%\npm\codex.cmd")
+        if os.path.exists(npm_path):
+            print(f"DEBUG: Using npm codex.cmd at {npm_path}", file=sys.stderr)
+            return [npm_path]
+            
+        # Fallback: try the global npm install path with node
+        windows_path = os.path.expandvars(r"%APPDATA%\npm\node_modules\@openai\codex\bin\codex.js")
+        if os.path.exists(windows_path):
+            print(f"DEBUG: Using node + JS entry at {windows_path}", file=sys.stderr)
+            return ["node", windows_path]
+    else:
+        # On Unix-like systems, check for codex in PATH
+        found = which("codex")
+        if found:
+            print(f"DEBUG: Using codex executable at {found}", file=sys.stderr)
+            return [found]
 
-# Debug: Print the path we're using
-print(f"DEBUG: CODEX_PATH = {CODEX_PATH}")
-print(f"DEBUG: Path exists = {os.path.exists(CODEX_PATH)}")
+    # Last resort: hope shell can resolve 'codex'
+    print("DEBUG: 'codex' not found on PATH; falling back to 'codex'", file=sys.stderr)
+    return ["codex"]
+
+CODEX_INVOKER = resolve_codex_invoker()
 
 HEADER_RE = re.compile(
     r'^'
@@ -70,8 +102,8 @@ def run_and_extract_codex_blocks(
     # If safe_mode is False (--yolo), keep --full-auto as is
     
     # Debug: Print what we're trying to run
-    print(f"DEBUG: Safe mode = {safe_mode}")
-    print(f"DEBUG: Running command: {' '.join(final_cmd)}")
+    print(f"DEBUG: Safe mode = {safe_mode}", file=sys.stderr)
+    print(f"DEBUG: Running command: {' '.join(final_cmd)}", file=sys.stderr)
     
     try:
         proc = subprocess.run(
@@ -83,17 +115,17 @@ def run_and_extract_codex_blocks(
         )
         
         if proc.stderr:
-            print(f"DEBUG: stderr: {proc.stderr}")
+            print(f"DEBUG: stderr: {proc.stderr}", file=sys.stderr)
         if proc.returncode != 0:
-            print(f"DEBUG: Return code: {proc.returncode}")
+            print(f"DEBUG: Return code: {proc.returncode}", file=sys.stderr)
             
         out = proc.stdout
-        print(f"DEBUG: Raw stdout (first 500 chars): {out[:500] if out else 'EMPTY'}")
-        print(f"DEBUG: Raw stdout length: {len(out) if out else 0}")
+        print(f"DEBUG: Raw stdout (first 500 chars): {out[:500] if out else 'EMPTY'}", file=sys.stderr)
+        print(f"DEBUG: Raw stdout length: {len(out) if out else 0}", file=sys.stderr)
         
     except Exception as e:
-        print(f"DEBUG: Exception running command: {e}")
-        print(f"DEBUG: Exception type: {type(e)}")
+        print(f"DEBUG: Exception running command: {e}", file=sys.stderr)
+        print(f"DEBUG: Exception type: {type(e)}", file=sys.stderr)
         raise
     
     blocks = []
@@ -103,11 +135,11 @@ def run_and_extract_codex_blocks(
             raw = f'[{ts}] {tag}\n{body}'
             blocks.append({"timestamp": ts, "tag": tag, "body": body, "raw": raw})
     
-    print(f"DEBUG: Found {len(blocks)} blocks matching pattern")
+    print(f"DEBUG: Found {len(blocks)} blocks matching pattern", file=sys.stderr)
     
     # If no blocks found but we have output, return the raw output
     if not blocks and out:
-        print("DEBUG: No blocks found, returning raw output")
+        print("DEBUG: No blocks found, returning raw output", file=sys.stderr)
         return [{"timestamp": "unknown", "tag": "codex", "body": out, "raw": out}]
     
     # Return only the last n blocks
@@ -217,13 +249,11 @@ async def codex_execute(prompt: str, work_dir: str, ctx: Context) -> str:
         work_dir (str): The working directory, e.g. /Users/kevin/Projects/demo_project
         ctx (Context): MCP context for logging
     """
-    # Use --json for non-interactive output
+    # Call Codex CLI non-interactively with the prompt as an argument
     cmd = [
-        "node", CODEX_PATH, "exec",
-        "--json",  # Output as JSONL for non-interactive mode
+        *CODEX_INVOKER, "exec",
         "--skip-git-repo-check",
         "--cd", work_dir,
-        # Prompt will be passed via stdin
     ]
     
     if SAFE_MODE == True:
@@ -232,39 +262,28 @@ async def codex_execute(prompt: str, work_dir: str, ctx: Context) -> str:
         cmd.extend(["--sandbox", "workspace-write"])
     else:
         cmd.append("--full-auto")
+
+    # Positional prompt must be last
+    cmd.append(prompt)
     
-    print(f"DEBUG: Running: {' '.join(cmd)}")
-    print(f"DEBUG: With prompt: {prompt[:100]}...")
+    print(f"DEBUG: Running: {' '.join(cmd)}", file=sys.stderr)
+    print(f"DEBUG: With prompt: {prompt[:100]}...", file=sys.stderr)
     
     try:
         proc = subprocess.run(
             cmd,
-            input=prompt,  # Pass prompt via stdin
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
             shell=False,
             timeout=300  # 5 minute timeout
         )
-        
+
         if proc.stdout:
-            print(f"DEBUG: Got output: {len(proc.stdout)} chars")
-            # If using --json, parse the JSONL output
-            lines = proc.stdout.strip().split('\n')
-            messages = []
-            for line in lines:
-                if line:
-                    try:
-                        import json
-                        data = json.loads(line)
-                        if 'content' in data or 'message' in data:
-                            messages.append(data.get('content', data.get('message', '')))
-                    except:
-                        messages.append(line)  # Fallback to raw line
-            
-            return '\n'.join(messages) if messages else proc.stdout
-            
+            print(f"DEBUG: Got output: {len(proc.stdout)} chars", file=sys.stderr)
+            return proc.stdout
         elif proc.stderr:
+            print(f"DEBUG: Got stderr: {len(proc.stderr)} chars", file=sys.stderr)
             return f"Error: {proc.stderr}"
         else:
             return "No output from codex"
@@ -273,6 +292,12 @@ async def codex_execute(prompt: str, work_dir: str, ctx: Context) -> str:
         return "Error: Codex command timed out after 5 minutes"
     except Exception as e:
         return f"Error: {str(e)}"
+
+
+@mcp.tool()
+async def ping() -> str:
+    """Lightweight health check to verify MCP handshake and tool calls."""
+    return "pong"
 
 
 @mcp.tool()
@@ -360,12 +385,15 @@ async def codex_review(review_type: str, work_dir: str, target: str = "", prompt
     )
     
     cmd = [
-        "node", CODEX_PATH, "exec",
+        *CODEX_INVOKER, "exec",
         "--full-auto", "--skip-git-repo-check",
         "--cd", work_dir,
         final_prompt,
     ]
-    return run_and_extract_codex_blocks(cmd, safe_mode=SAFE_MODE)[-1]["raw"]
+    blocks = run_and_extract_codex_blocks(cmd, safe_mode=SAFE_MODE)
+    if not blocks:
+        return "No output from codex"
+    return blocks[-1]["raw"]
 
 
 def main():
@@ -432,11 +460,11 @@ and conflicting system modifications. Sequential execution is safer.
         SAFE_MODE = True
     
     if SAFE_MODE == True:
-        print("Running in SAFE mode (read-only). Use --skip-git or --yolo for write modes.")
+        print("Running in SAFE mode (read-only). Use --skip-git or --yolo for write modes.", file=sys.stderr)
     elif SAFE_MODE == "skip-git":
-        print("Running in WORKSPACE-WRITE mode (skip git check). Use --yolo for full auto.")
+        print("Running in WORKSPACE-WRITE mode (skip git check). Use --yolo for full auto.", file=sys.stderr)
     else:
-        print("Running in FULL AUTO mode. Codex can modify files and system state.")
+        print("Running in FULL AUTO mode. Codex can modify files and system state.", file=sys.stderr)
     
     mcp.run()
 
